@@ -445,12 +445,12 @@ function App() {
             <div className={`${t.card} rounded-2xl border ${t.border} overflow-hidden`}>
               <div className="overflow-x-auto"><table className="w-full text-xs">
                 <thead className="sticky top-0 z-10"><tr className={`${t.tableStripe} border-b ${t.border}`}>
-                  {["Plat","Loja","Mês","SKU","Qtd","Receita","Taxas","Repasse","Custo","Lucro"].map(h =>
+                  {["ID Pedido","Plat","Loja","Mês","SKU","Qtd","Receita","Taxas","Repasse","Custo","Lucro"].map(h =>
                     <th key={h} className={`px-3 py-2.5 text-[10px] ${t.textSub} font-bold text-left uppercase tracking-wider`}>{h}</th>)}</tr></thead>
                 <tbody>{pgOrders.map((o, i) => {
                   const c = (costs[o.sku] || 0) * o.qtd, l = o.repasse - c;
                   return (<tr key={i} className={`border-b border-transparent ${t.tableRow} ${i % 2 ? t.tableStripe : ""}`}>
-                    <td className={`px-3 py-2 ${t.textSub}`}>{o.plataforma}</td><td className={`px-3 py-2 ${t.textSub}`}>{o.loja}</td>
+                    <td className={`px-3 py-2 ${t.accentText} font-mono text-[11px] cursor-pointer hover:underline`} title="Clique para copiar" onClick={() => { navigator.clipboard.writeText(o.id); }}>{o.id}</td><td className={`px-3 py-2 ${t.textSub}`}>{o.plataforma}</td><td className={`px-3 py-2 ${t.textSub}`}>{o.loja}</td>
                     <td className={`px-3 py-2 ${t.textMuted}`}>{o.mes}</td><td className={`px-3 py-2 ${t.text} font-medium truncate max-w-[150px]`}>{o.sku}</td>
                     <td className={`px-3 py-2 ${t.textSub} text-right tabular-nums`}>{o.qtd}</td>
                     <td className={`px-3 py-2 ${t.text} text-right tabular-nums`}>{fmt(o.receita)}</td>
