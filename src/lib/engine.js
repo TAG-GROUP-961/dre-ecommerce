@@ -2,6 +2,7 @@ import * as XLSX from 'xlsx';
 
 const p = v => parseFloat(v) || 0;
 const s = v => String(v || "");
+const abs = v => Math.abs(p(v));
 
 export const DEFAULT_STORES = {
   Shopee: ["Shopee Najco", "Shopee Alfa", "Shopee Jex"],
@@ -27,13 +28,10 @@ export function readExcelFile(file) {
       try {
         const data = new Uint8Array(e.target.result);
         const wb = XLSX.read(data, { type: "array" });
-        
         let bestJson = [];
         let bestScore = -1;
-        
         for (const name of wb.SheetNames) {
           const ws = wb.Sheets[name];
-          
           // Fix truncated ranges: scan for actual data extent
           if (ws["!ref"]) {
             const range = XLSX.utils.decode_range(ws["!ref"]);
@@ -51,10 +49,8 @@ export function readExcelFile(file) {
               }
             }
           }
-          
           const json = XLSX.utils.sheet_to_json(ws, { defval: "" });
           if (json.length === 0) continue;
-          
           // Score: prefer sheets with recognized platform columns
           const cols = Object.keys(json[0]).map(c => String(c).toLowerCase());
           let score = json.length;
@@ -64,13 +60,11 @@ export function readExcelFile(file) {
           if (cols.some(c => c.includes("transaction_amount") || c.includes("net_received_amount"))) score += 100000; // ML
           // Penalize sheets with __EMPTY columns (summary/report sheets)
           if (cols.some(c => c.includes("__empty"))) score -= 50000;
-          
           if (score > bestScore) {
             bestScore = score;
             bestJson = json;
           }
         }
-        
         resolve(bestJson);
       } catch (err) { reject(err); }
     };
@@ -102,11 +96,26 @@ export function readCostExcel(file) {
   });
 }
 
-// ═══ SHOPEE — corrected formula ═══
+// ═══════════════════════════════════════════════════════════════════════════
+// SHOPEE — fórmula validada April 2026
+//
+// IF Valor Total == 0  (pedido totalmente devolvido/estornado)
+//    Receita = 0
+//    Repasse = -Taxa de Envio Reversa
+// ELSE
+//    Receita = Subtotal do produto
+//    Bonus  = R$8 se Opção de envio == "Entrega Direta", senão 0
+//    FreteSeller = frete que o vendedor efetivamente paga:
+//       - 0 se Entrega Direta (Shopee cobre)
+//       - 0 se Desconto de Frete Aproximado ≈ Valor estimado do frete (Shopee cobre 100%)
+//       - max(0, freteEst - descFrete - freteComprador) caso contrário
+//    Repasse = Receita + Bonus - Cupom_vendedor - Comissão - Serviço - EnvioReversa - FreteSeller
+//    Taxas   = Receita - Repasse  (sempre consistente)
+//
+// Multi-item: taxas estão no primeiro row; distribui por proporção de Subtotal.
+// ═══════════════════════════════════════════════════════════════════════════
 export function processShopee(rows, store) {
   const conc = rows.filter(r => String(r["Status do pedido"]).trim() === "Concluído");
-
-  // Group by order to fix multi-item duplication
   const orderMap = {};
   conc.forEach(r => {
     const oid = s(r["ID do pedido"]);
@@ -116,158 +125,237 @@ export function processShopee(rows, store) {
 
   const results = [];
   Object.entries(orderMap).forEach(([oid, items]) => {
-    // Order-level values (same across all items)
     const first = items[0];
-    const tg = p(first["Total global"]);
-    const com = p(first["Taxa de comissão líquida"]);
-    const srv = p(first["Taxa de serviço líquida"]);
-    const freteEst = p(first["Valor estimado do frete"]);
-    const descFrete = p(first["Desconto de Frete Aproximado"]) || p(first["Desconto de Frete Aproximado"] || 0);
-    const freteComp = p(first["Taxa de envio pagas pelo comprador"]);
-    const envio = s(first["Opção de envio"]);
+    const valorTotal  = p(first["Valor Total"]);
+    const envioRev    = p(first["Taxa de Envio Reversa"]);
+    const com         = p(first["Taxa de comissão líquida"]);
+    const srv         = p(first["Taxa de serviço líquida"]);
+    const cupomVend   = p(first["Cupom do vendedor"]);
+    const freteEst    = p(first["Valor estimado do frete"]);
+    const descFrete   = p(first["Desconto de Frete Aproximado"]);
+    const freteComp   = p(first["Taxa de envio pagas pelo comprador"]);
+    const envio       = s(first["Opção de envio"]);
+    const statusDevol = s(first["Status da Devolução / Reembolso"]);
 
-    // Frete that seller actually pays
-    let freteVendedor = 0;
-    if (envio === "Entrega Direta") {
-      freteVendedor = -8; // Shopee PAYS R$8 to seller
-    } else if (Math.abs(descFrete - freteEst) < 0.02) {
-      freteVendedor = 0; // Shopee covers 100% of frete
-    } else if (descFrete === 0 || descFrete === '') {
-      freteVendedor = freteEst; // Seller pays full frete
+    // Sum subtotals across all items for this order
+    const orderSubtotal = items.reduce((sum, r) => sum + p(r["Subtotal do produto"]), 0);
+
+    let orderReceita, orderRepasse, orderTaxas;
+
+    if (valorTotal === 0) {
+      // Full refund / devolução total
+      orderReceita = 0;
+      orderRepasse = -envioRev;
+      orderTaxas   = envioRev;
     } else {
-      freteVendedor = freteEst - descFrete - freteComp; // Partial subsidy
-      if (freteVendedor < 0) freteVendedor = 0;
+      const bonusED = envio === "Entrega Direta" ? 8 : 0;
+      // Frete que o vendedor paga de fato
+      let freteSeller;
+      if (envio === "Entrega Direta") {
+        freteSeller = 0;
+      } else if (descFrete > 0 && Math.abs(descFrete - freteEst) < 0.02) {
+        freteSeller = 0; // Shopee subsidiou 100%
+      } else {
+        freteSeller = Math.max(0, freteEst - descFrete - freteComp);
+      }
+
+      orderReceita = orderSubtotal;
+      orderRepasse = orderReceita + bonusED - cupomVend - com - srv - envioRev - freteSeller;
+      orderTaxas   = orderReceita - orderRepasse;
     }
 
-    // Real repasse for this order
-    const orderRepasse = tg - com - srv - freteVendedor;
-    const orderTaxas = com + srv + Math.max(freteVendedor, 0);
-
-    // Order subtotal (sum of all items)
-    const orderSubtotal = items.reduce((s, r) => s + p(r["Subtotal do produto"]), 0);
-
-    // Distribute to each SKU proportionally
+    // Distribute to each item line
     items.forEach(r => {
       const itemSubtotal = p(r["Subtotal do produto"]);
       const ratio = orderSubtotal > 0 ? itemSubtotal / orderSubtotal : 1 / items.length;
-
+      // For refunded orders (receita=0), distribute the loss evenly
+      const itemReceita = orderReceita * ratio;
+      const itemRepasse = orderRepasse * ratio;
+      const itemTaxas   = orderTaxas * ratio;
       results.push({
         plataforma: "Shopee", loja: store, id: oid,
         sku: s(r["Número de referência SKU"]),
         produto: s(r["Nome do Produto"]),
         variacao: s(r["Nome da variação"]),
         qtd: parseInt(r["Quantidade"]) || 1,
-        receita: itemSubtotal,
+        receita: itemReceita,
         comissao: com * ratio,
         servico: srv * ratio,
-        fretePlat: freteVendedor * ratio,
-        taxas: orderTaxas * ratio,
-        repasse: orderRepasse * ratio,
+        fretePlat: 0, // no longer tracked separately (mixed in taxas)
+        taxas: itemTaxas,
+        repasse: itemRepasse,
         envio: envio,
         data: s(r["Data de criação do pedido"]),
+        // debug
+        _raw_vt: valorTotal,
+        _raw_envio_rev: envioRev,
+        _raw_cupom: cupomVend,
+        _is_refund: valorTotal === 0,
+        _status_devol: statusDevol,
       });
     });
   });
-
   return results;
 }
 
-// ═══ TIKTOK — with date filter ═══
+// ═══════════════════════════════════════════════════════════════════════════
+// TIKTOK — fórmula validada April 2026
+//
+// Inclui tipos:
+//   - "Pedido": venda normal (ou com refund embedded)
+//   - "Reembolso de logística": ajuste positivo de logística
+//   - "Reembolso", "Devolução", "Ajuste" (se aparecerem)
+//
+// Para Pedido:
+//   Receita = Vendas líquidas dos produtos (NÃO usa subtotal como fallback — evita
+//             contar pedidos estornados como receita falsa)
+//   Repasse = Valor total a ser liquidado
+//   Taxas   = Receita - Repasse  (sempre consistente)
+//
+// Filtro mensal: mantido via monthFilter.
+// ═══════════════════════════════════════════════════════════════════════════
 export function processTikTok(rows, store, monthFilter) {
-  // DEBUG
-  console.log(`[TikTok Debug] Total rows: ${rows.length}, monthFilter: "${monthFilter}"`);
-  if (rows.length > 0) {
-    const sample = rows[0];
-    const dateVal = sample["Data de criação do pedido"];
-    const tipoVal = sample["Tipo de transação"];
-    console.log(`[TikTok Debug] First row: tipo="${tipoVal}" (type: ${typeof tipoVal}), date="${dateVal}" (type: ${typeof dateVal})`);
-    console.log(`[TikTok Debug] parseDateToMonthKey("${dateVal}") = "${parseDateToMonthKey(dateVal)}"`);
-    // Show first 5 unique tipos
-    const tipos = [...new Set(rows.map(r => String(r["Tipo de transação"]).trim()))];
-    console.log(`[TikTok Debug] Unique tipos: ${JSON.stringify(tipos)}`);
-    // Count pedidos
-    const pedidos = rows.filter(r => String(r["Tipo de transação"]).trim() === "Pedido");
-    console.log(`[TikTok Debug] Pedido rows: ${pedidos.length}`);
-    if (pedidos.length > 0) {
-      const dates = pedidos.slice(0, 5).map(r => {
-        const d = r["Data de criação do pedido"];
-        return { raw: d, type: typeof d, key: parseDateToMonthKey(d) };
-      });
-      console.log(`[TikTok Debug] Sample dates:`, JSON.stringify(dates));
-    }
-  }
+  const results = [];
+  rows.forEach(r => {
+    const tipo = s(r["Tipo de transação"]).trim();
+    if (!tipo) return;
 
-  return rows
-    .filter(r => {
-      if (String(r["Tipo de transação"]).trim() !== "Pedido") return false;
-      if (monthFilter) {
-        const key = parseDateToMonthKey(r["Data de criação do pedido"]);
-        if (key && key !== monthFilter) return false;
-      }
-      return true;
-    })
-    .map(r => {
-      const vl = p(r["Vendas líquidas dos produtos"]);
-      const sub = p(r["Subtotal do item antes dos descontos"]);
-      const com = Math.abs(p(r["Tarifa de comissão da plataforma"]));
-      const srv = Math.abs(p(r["Taxas de serviço"]));
-      const af = Math.abs(p(r["Comissões de afiliados"]));
-      const fl = Math.abs(p(r["Custo líquido de frete"]));
-      const val = p(r["Valor total a ser liquidado"]);
-      const rec = vl > 0 ? vl : sub;
-      return {
-        plataforma: "TikTok", loja: store, id: s(r["ID do pedido/ajuste"]),
-        sku: s(r["Nome do SKU"]) || "default",
-        produto: s(r["Nome do produto"]),
-        variacao: s(r["Nome do SKU"]), qtd: parseInt(r["Quantidade"]) || 1,
-        receita: rec, comissao: com, servico: srv + af, fretePlat: fl,
-        taxas: com + srv + af + fl, repasse: val,
-        data: parseDateToLabel(r["Data de criação do pedido"]),
-      };
-    });
-}// ═══ ML — unchanged ═══
-export function processML(rows, store) {
-  return rows
-    .filter(r => String(r["Status da operação (status)"]).trim() === "approved")
-    .map(r => {
-      const vp = p(r["Valor do produto (transaction_amount)"]);
-      const fr = Math.abs(p(r["Frete (shipping_cost)"]));
-      const nr = p(r["Valor total recebido (net_received_amount)"]);
-      const tt = vp - nr;
-      return {
-        plataforma: "Mercado Livre", loja: store,
-        id: s(r["Número da venda no Mercado Livre (order_id)"]),
-        sku: s(r["SKU do produto (seller_custom_field)"]),
-        produto: s(r["Descrição da operação (reason)"]),
-        variacao: "", qtd: 1, receita: vp, comissao: tt - fr, servico: 0,
-        fretePlat: fr, taxas: tt, repasse: nr,
-        data: s(r["Data da compra (date_created)"]),
-      };
-    });
+    // Apply month filter to everything
+    if (monthFilter) {
+      const key = parseDateToMonthKey(r["Data de criação do pedido"]);
+      if (key && key !== monthFilter) return;
+    }
+
+    const oid = s(r["ID do pedido/ajuste"]);
+    const sku = s(r["Nome do SKU"]) || "default";
+    const produto = s(r["Nome do produto"]);
+    const qtd = parseInt(r["Quantidade"]) || 1;
+    const dataRaw = r["Data de criação do pedido"];
+
+    if (tipo === "Pedido") {
+      // Always use vendas líquidas — if 0, it was a full refund, receita should be 0
+      const receita = p(r["Vendas líquidas dos produtos"]);
+      const repasse = p(r["Valor total a ser liquidado"]);
+
+      // Fee breakdown (for informational display; total taxas = receita - repasse for consistency)
+      const com       = abs(r["Tarifa de comissão da plataforma"]);
+      const srv       = abs(r["Taxas de serviço"]);
+      const srvSfp    = abs(r["Taxa de serviço do SFP"]);
+      const txItem    = abs(r["Taxa por item vendido"]);
+      const af        = abs(r["Comissões de afiliados"]);
+      const impostos  = abs(r["Impostos"]) + abs(r["ICMS DIFAL"]) + abs(r["Multa de ICMS"]);
+      const fl        = abs(r["Custo líquido de frete"]);
+      const planoImp  = abs(r["Plano de serviço gerenciado (Imposto sobre vendas)"]);
+      const planoPed  = abs(r["Plano de serviço gerenciado (Taxa por pedido)"]);
+
+      const taxas = receita - repasse; // canonical total
+
+      results.push({
+        plataforma: "TikTok", loja: store, id: oid,
+        sku, produto, variacao: sku, qtd,
+        receita, comissao: com, servico: srv + srvSfp + txItem + af, fretePlat: fl,
+        taxas, repasse,
+        data: parseDateToLabel(dataRaw),
+        _is_refund: receita === 0 && p(r["Subtotal do item antes dos descontos"]) > 0,
+        _extra_taxas: impostos + planoImp + planoPed,
+      });
+    } else if (tipo === "Reembolso de logística" || tipo === "Reembolso" || tipo === "Devolução" || tipo === "Ajuste") {
+      // Adjustments that affect repasse but not receita
+      const ajuste = p(r["Valor do ajuste"]) || p(r["Valor total a ser liquidado"]);
+      if (ajuste === 0) return;
+      results.push({
+        plataforma: "TikTok", loja: store, id: oid,
+        sku: sku || "AJUSTE", produto: produto || `${tipo}`,
+        variacao: tipo, qtd: 0,
+        receita: 0, comissao: 0, servico: 0, fretePlat: 0,
+        taxas: -ajuste,  // negative taxas = positive repasse adjustment
+        repasse: ajuste,
+        data: parseDateToLabel(dataRaw),
+        _is_adjustment: true,
+        _tipo: tipo,
+      });
+    }
+  });
+  return results;
 }
 
-// Robust date parser: handles JS Date objects, "2026/03/30", "30/03/2026", "2026-03-30", Excel serial numbers
+// ═══════════════════════════════════════════════════════════════════════════
+// MERCADO LIVRE — fórmula validada April 2026
+//
+// Inclui status:
+//   - "approved": venda normal
+//   - "refunded": venda estornada (entra como DOIS efeitos: -receita, -repasse_líquido)
+//
+// Exclui: rejected, pending, in_mediation, cancelled (não movimentaram dinheiro real
+// — ou estão em limbo que não afeta fechamento atual).
+//
+// Para approved:
+//   Receita = transaction_amount
+//   Repasse = net_received_amount - amount_refunded (reembolsos parciais)
+//
+// Para refunded:
+//   Receita = -transaction_amount (reverte a venda)
+//   Repasse = net_received_amount - amount_refunded (normalmente negativo)
+//
+// Taxas = Receita - Repasse (consistente).
+// ═══════════════════════════════════════════════════════════════════════════
+export function processML(rows, store) {
+  const results = [];
+  rows.forEach(r => {
+    const status = s(r["Status da operação (status)"]).trim();
+    if (status !== "approved" && status !== "refunded") return;
+
+    const vp  = p(r["Valor do produto (transaction_amount)"]);
+    const fr  = Math.abs(p(r["Frete (shipping_cost)"]));
+    const nr  = p(r["Valor total recebido (net_received_amount)"]);
+    const ref = p(r["Valor devolvido (amount_refunded)"]);
+
+    let receita, repasse;
+    if (status === "refunded") {
+      receita = -vp;
+      repasse = nr - ref; // geralmente negativo (perda real ao vendedor)
+    } else {
+      receita = vp;
+      repasse = nr - ref; // se houver reembolso parcial, desconta
+    }
+    const taxas = receita - repasse;
+
+    results.push({
+      plataforma: "Mercado Livre", loja: store,
+      id: s(r["Número da venda no Mercado Livre (order_id)"]),
+      sku: s(r["SKU do produto (seller_custom_field)"]),
+      produto: s(r["Descrição da operação (reason)"]),
+      variacao: "", qtd: status === "refunded" ? -1 : 1,
+      receita, comissao: taxas - fr, servico: 0,
+      fretePlat: fr, taxas, repasse,
+      data: s(r["Data da compra (date_created)"]),
+      _status: status,
+      _refunded: ref,
+      _is_refund: status === "refunded",
+    });
+  });
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Date helpers — unchanged (already robust)
+// ═══════════════════════════════════════════════════════════════════════════
 function parseDateToMonthKey(val) {
   if (!val) return null;
-  // JS Date object (SheetJS often returns these)
   if (val instanceof Date || (typeof val === 'object' && val.getMonth)) {
     const mm = String(val.getMonth() + 1).padStart(2, '0');
     return `${mm}/${val.getFullYear()}`;
   }
-  // Excel serial number (days since 1899-12-30)
   if (typeof val === 'number' && val > 40000 && val < 60000) {
     const d = new Date((val - 25569) * 86400000);
     const mm = String(d.getMonth() + 1).padStart(2, '0');
     return `${mm}/${d.getFullYear()}`;
   }
   const d = String(val);
-  // "2026/03/30" or "2026-03-30"
   let m = d.match(/(\d{4})[\/-](\d{1,2})/);
   if (m) return `${m[2].padStart(2, '0')}/${m[1]}`;
-  // "30/03/2026"
   m = d.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
   if (m) return `${m[2].padStart(2, '0')}/${m[3]}`;
-  // "Mon Mar 30 2026..." (JS Date.toString())
   const monthNames = {Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12'};
   m = d.match(/([A-Z][a-z]{2})\s.*?(\d{4})/);
   if (m && monthNames[m[1]]) return `${monthNames[m[1]]}/${m[2]}`;
@@ -282,15 +370,9 @@ function parseDateToLabel(val) {
   return `${ms[parseInt(mm)]}/${yyyy}`;
 }
 
-export function extractMonth(d) {
-  return parseDateToLabel(d);
-}
+export function extractMonth(d) { return parseDateToLabel(d); }
+export function extractMonthKey(d) { return parseDateToMonthKey(d); }
 
-export function extractMonthKey(d) {
-  return parseDateToMonthKey(d);
-}
-
-// Get unique months from TikTok data for filter dropdown
 export function getTikTokMonths(rows) {
   const months = new Set();
   rows.filter(r => String(r["Tipo de transação"]).trim() === "Pedido").forEach(r => {
@@ -300,9 +382,29 @@ export function getTikTokMonths(rows) {
   return [...months].sort();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// RECONCILIATION — new helper for validation tab
+// Returns per-platform totals for quick visual diff against Upseller/platform seller center
+// ═══════════════════════════════════════════════════════════════════════════
+export function reconciliationSummary(orders) {
+  const byPlat = {};
+  const byStore = {};
+  orders.forEach(o => {
+    for (const [key, map] of [[o.plataforma, byPlat], [o.loja, byStore]]) {
+      if (!map[key]) map[key] = { n: 0, receita: 0, taxas: 0, repasse: 0, refunds: 0, adjustments: 0 };
+      map[key].n++;
+      map[key].receita += o.receita;
+      map[key].taxas += o.taxas;
+      map[key].repasse += o.repasse;
+      if (o._is_refund) map[key].refunds++;
+      if (o._is_adjustment) map[key].adjustments++;
+    }
+  });
+  return { byPlat, byStore };
+}
+
 export function exportToExcel(orders, costs, despesas) {
   const wb = XLSX.utils.book_new();
-
   const base = orders.map(o => ({
     Plataforma: o.plataforma, Loja: o.loja, Mes: o.mes, ID: o.id,
     SKU: o.sku, Produto: o.produto, Qtd: o.qtd,
@@ -313,9 +415,10 @@ export function exportToExcel(orders, costs, despesas) {
     "Custo Total": +((costs[o.sku] || 0) * o.qtd).toFixed(2),
     Lucro: +(o.repasse - (costs[o.sku] || 0) * o.qtd).toFixed(2),
     Data: o.data,
+    Refund: o._is_refund ? "S" : "",
+    Ajuste: o._is_adjustment ? "S" : "",
   }));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(base), "BASE_CONSOLIDADA");
-
   // DRE
   const months = [...new Set(orders.map(o => o.mes))].sort();
   const totalDesp = Object.values(despesas || {}).reduce((s, v) => s + (parseFloat(v) || 0), 0);
@@ -341,16 +444,13 @@ export function exportToExcel(orders, costs, despesas) {
     return row;
   });
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(dreRows), "DRE");
-
   // CUSTOS
   const cr = Object.entries(costs).filter(([, v]) => v > 0).map(([sku, cost]) => ({ SKU: sku, "Custo Unitario": cost }));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(cr), "CUSTOS");
-
   // DESPESAS
   if (despesas && Object.keys(despesas).length > 0) {
     const dr = Object.entries(despesas).filter(([,v]) => parseFloat(v) > 0).map(([nome, valor]) => ({ Despesa: nome, "Valor (R$)": parseFloat(valor) }));
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(dr), "DESPESAS");
   }
-
   XLSX.writeFile(wb, `DRE_Consolidado.xlsx`);
 }
