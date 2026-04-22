@@ -4,7 +4,8 @@ import _ from "lodash";
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
 import {
   detectPlatform, readExcelFile, readCostExcel, processShopee, processTikTok,
-  processML, extractMonth, getTikTokMonths, exportToExcel, DEFAULT_STORES
+  processML, extractMonth, getTikTokMonths, exportToExcel, DEFAULT_STORES,
+  reconciliationSummary, detectAnomalies, compareExpected
 } from "@/lib/engine";
 
 /* ═══ Theme ═══ */
@@ -99,9 +100,11 @@ function App() {
   const [stores, setStores] = useState(() => { if (typeof window !== 'undefined') { try { const s = localStorage.getItem('dre-stores'); return s ? JSON.parse(s) : { ...DEFAULT_STORES }; } catch { return { ...DEFAULT_STORES }; } } return { ...DEFAULT_STORES }; });
   const [newDesp, setNewDesp] = useState("");
   const [newStore, setNewStore] = useState({ platform: "Shopee", name: "" });
+  const [expected, setExpected] = useState(() => { if (typeof window !== 'undefined') { try { return JSON.parse(localStorage.getItem('dre-expected-repasse')) || {}; } catch { return {}; } } return {}; });
   useEffect(() => { try { localStorage.setItem('dre-sku-costs', JSON.stringify(costs)); } catch {} }, [costs]);
   useEffect(() => { try { localStorage.setItem('dre-despesas', JSON.stringify(despesas)); } catch {} }, [despesas]);
   useEffect(() => { try { localStorage.setItem('dre-stores', JSON.stringify(stores)); } catch {} }, [stores]);
+  useEffect(() => { try { localStorage.setItem('dre-expected-repasse', JSON.stringify(expected)); } catch {} }, [expected]);
 
   const [pending, setPending] = useState([]);
   const [tab, setTab] = useState("upload");
@@ -209,11 +212,17 @@ function App() {
   const tabs = [
     { id: "upload", label: "Upload", icon: "📁" },
     { id: "dre", label: "DRE", icon: "📊", off: !orders.length },
+    { id: "validacao", label: "Validação", icon: "✅", off: !orders.length },
     { id: "custos", label: "Custos", icon: "💰", off: !orders.length },
     { id: "despesas", label: "Despesas", icon: "🧾", off: !orders.length },
     { id: "pedidos", label: "Pedidos", icon: "📋", off: !orders.length },
     { id: "config", label: "Lojas", icon: "⚙️" },
   ];
+
+  // Reconciliação/validação
+  const recon = useMemo(() => reconciliationSummary(orders), [orders]);
+  const reconStoreRows = useMemo(() => compareExpected(recon.byStore, expected), [recon.byStore, expected]);
+  const anomalies = useMemo(() => detectAnomalies(orders, costs), [orders, costs]);
 
   const platBadge = { Shopee: "bg-[#FF6B35]/15 text-[#FF6B35] border-[#FF6B35]/30", TikTok: "bg-[#69C9D0]/15 text-[#69C9D0] border-[#69C9D0]/30", "Mercado Livre": "bg-[#FFE600]/15 text-[#c5b200] border-[#FFE600]/30" };
 
@@ -355,6 +364,124 @@ function App() {
             {monthRows.length > 2 && <Table title="Por Mês" rows={monthRows} cols={tCols} />}
             <Table title="Por Plataforma" rows={platRows} cols={tCols} />
             <Table title="Por Loja" rows={storeRows} cols={tCols} />
+          </div>)}
+
+        {/* ═══ VALIDAÇÃO ═══ */}
+        {tab === "validacao" && (
+          <div className="space-y-5">
+            <div className="flex items-start justify-between flex-wrap gap-3">
+              <div>
+                <h2 className={`text-lg font-extrabold ${t.text}`}>Validação / Conciliação</h2>
+                <p className={`${t.textSub} text-xs mt-0.5`}>Compare o repasse calculado com o que a plataforma realmente te pagou. Preencha o valor esperado por loja.</p>
+              </div>
+              <button onClick={() => { if (confirm("Zerar todos os valores esperados?")) setExpected({}); }}
+                className={`px-3 py-1.5 ${t.card} border ${t.border} ${t.textSub} text-xs rounded-lg ${t.cardHover}`}>Zerar esperados</button>
+            </div>
+
+            {/* Anomalias */}
+            {anomalies.length > 0 && (
+              <div className={`${t.card} rounded-2xl border ${t.border} overflow-hidden`}>
+                <div className={`px-5 py-3 border-b ${t.border} flex items-center gap-2`}>
+                  <h3 className={`${t.text} font-bold text-[13px] uppercase tracking-wider`}>Anomalias detectadas</h3>
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${t.redBg} border`}>{anomalies.length}</span>
+                </div>
+                <div className={`divide-y ${t.border}`}>
+                  {anomalies.map((a, i) => {
+                    const cls = a.level === "error" ? t.redBg : a.level === "warn" ? (t.dark ? "bg-amber-500/10 border-amber-500/20 text-amber-300" : "bg-amber-50 border-amber-200 text-amber-700") : t.accentLight;
+                    const icon = a.level === "error" ? "🚨" : a.level === "warn" ? "⚠️" : "ℹ️";
+                    return (<div key={i} className={`px-5 py-3 flex items-start gap-3 text-sm ${cls}`}>
+                      <span className="text-lg">{icon}</span>
+                      <div className="flex-1"><span className="font-bold">{a.loja}:</span> {a.msg}</div>
+                    </div>);
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Tabela conciliação por loja */}
+            <div className={`${t.card} rounded-2xl border ${t.border} overflow-hidden`}>
+              <div className={`px-5 py-3 border-b ${t.border}`}><h3 className={`${t.text} font-bold text-[13px] uppercase tracking-wider`}>Conciliação por loja</h3></div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-[13px]">
+                  <thead><tr className={`border-b ${t.border}`}>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-left`}>Loja</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Pedidos</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Receita</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Taxas</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Taxa %</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Repasse calc</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Repasse esperado</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Diff</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Refunds</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Ajustes</th>
+                  </tr></thead>
+                  <tbody>
+                    {reconStoreRows.map((r, i) => {
+                      const taxaPct = r.receita > 0 ? (r.taxas / r.receita) : 0;
+                      const statusCls = r.status === "ok" ? t.greenBg : r.status === "warn" ? (t.dark ? "bg-amber-500/10 text-amber-300" : "bg-amber-50 text-amber-700") : r.status === "error" ? t.redBg : "";
+                      return (<tr key={i} className={`border-b border-transparent ${t.tableRow} ${i % 2 ? t.tableStripe : ""}`}>
+                        <td className={`px-4 py-2.5 ${t.text} font-semibold`}>{r.loja}</td>
+                        <td className={`px-4 py-2.5 ${t.textSub} text-right tabular-nums`}>{fmtInt(r.n)}</td>
+                        <td className={`px-4 py-2.5 ${t.text} text-right tabular-nums`}>R$ {fmt(r.receita)}</td>
+                        <td className={`px-4 py-2.5 ${t.red} text-right tabular-nums`}>R$ {fmt(r.taxas)}</td>
+                        <td className={`px-4 py-2.5 ${t.textSub} text-right tabular-nums`}>{(taxaPct*100).toFixed(1)}%</td>
+                        <td className={`px-4 py-2.5 ${t.text} text-right tabular-nums font-semibold`}>R$ {fmt(r.repasse)}</td>
+                        <td className="px-4 py-2 text-right">
+                          <input type="number" step="0.01" min="0" placeholder="0,00"
+                            className={`w-32 text-right text-sm rounded-lg px-2 py-1 border outline-none tabular-nums ${t.input}`}
+                            value={expected[r.loja] || ""}
+                            onChange={e => setExpected(prev => ({ ...prev, [r.loja]: e.target.value }))} />
+                        </td>
+                        <td className={`px-4 py-2.5 text-right tabular-nums font-bold ${statusCls}`}>
+                          {r.diff === null ? <span className={t.textMuted}>—</span> : `${r.diff >= 0 ? "+" : ""}${fmt(r.diff)} (${r.diffPct >= 0 ? "+" : ""}${(r.diffPct*100).toFixed(2)}%)`}
+                        </td>
+                        <td className={`px-4 py-2.5 text-right tabular-nums ${r.refunds > 0 ? t.red : t.textSub}`}>{r.refunds}</td>
+                        <td className={`px-4 py-2.5 text-right tabular-nums ${t.textSub}`}>{r.adjustments}</td>
+                      </tr>);
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <div className={`px-5 py-3 border-t ${t.border} text-[11px] ${t.textSub} flex flex-wrap gap-4`}>
+                <span><span className="inline-block w-2 h-2 rounded-full bg-emerald-500 mr-1.5 align-middle"></span> diff &lt; 1% (ok)</span>
+                <span><span className="inline-block w-2 h-2 rounded-full bg-amber-500 mr-1.5 align-middle"></span> 1–3% (atenção)</span>
+                <span><span className="inline-block w-2 h-2 rounded-full bg-rose-500 mr-1.5 align-middle"></span> &gt; 3% (investigar)</span>
+                <span className="ml-auto">Valores esperados salvos automaticamente.</span>
+              </div>
+            </div>
+
+            {/* Totais por plataforma */}
+            <div className={`${t.card} rounded-2xl border ${t.border} overflow-hidden`}>
+              <div className={`px-5 py-3 border-b ${t.border}`}><h3 className={`${t.text} font-bold text-[13px] uppercase tracking-wider`}>Resumo por plataforma</h3></div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-[13px]">
+                  <thead><tr className={`border-b ${t.border}`}>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-left`}>Plataforma</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Pedidos</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Receita</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Taxas</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Taxa %</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Repasse</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Refunds</th>
+                    <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Ajustes</th>
+                  </tr></thead>
+                  <tbody>
+                    {Object.entries(recon.byPlat).map(([plat, st], i) => (
+                      <tr key={plat} className={`border-b border-transparent ${t.tableRow} ${i % 2 ? t.tableStripe : ""}`}>
+                        <td className={`px-4 py-2.5 ${t.text} font-semibold`}>{plat}</td>
+                        <td className={`px-4 py-2.5 ${t.textSub} text-right tabular-nums`}>{fmtInt(st.n)}</td>
+                        <td className={`px-4 py-2.5 ${t.text} text-right tabular-nums`}>R$ {fmt(st.receita)}</td>
+                        <td className={`px-4 py-2.5 ${t.red} text-right tabular-nums`}>R$ {fmt(st.taxas)}</td>
+                        <td className={`px-4 py-2.5 ${t.textSub} text-right tabular-nums`}>{st.receita > 0 ? (st.taxas/st.receita*100).toFixed(1) : "0.0"}%</td>
+                        <td className={`px-4 py-2.5 ${t.text} text-right tabular-nums font-semibold`}>R$ {fmt(st.repasse)}</td>
+                        <td className={`px-4 py-2.5 text-right tabular-nums ${st.refunds > 0 ? t.red : t.textSub}`}>{st.refunds}</td>
+                        <td className={`px-4 py-2.5 text-right tabular-nums ${t.textSub}`}>{st.adjustments}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </div>)}
 
         {/* ═══ CUSTOS ═══ */}

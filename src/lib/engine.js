@@ -383,15 +383,16 @@ export function getTikTokMonths(rows) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// RECONCILIATION — new helper for validation tab
-// Returns per-platform totals for quick visual diff against Upseller/platform seller center
+// RECONCILIATION — helpers for Validação tab
 // ═══════════════════════════════════════════════════════════════════════════
 export function reconciliationSummary(orders) {
   const byPlat = {};
   const byStore = {};
+  const byStoreMonth = {};
   orders.forEach(o => {
-    for (const [key, map] of [[o.plataforma, byPlat], [o.loja, byStore]]) {
-      if (!map[key]) map[key] = { n: 0, receita: 0, taxas: 0, repasse: 0, refunds: 0, adjustments: 0 };
+    const keyMes = `${o.loja}|${o.mes}`;
+    for (const [key, map] of [[o.plataforma, byPlat], [o.loja, byStore], [keyMes, byStoreMonth]]) {
+      if (!map[key]) map[key] = { n: 0, receita: 0, taxas: 0, repasse: 0, refunds: 0, adjustments: 0, plataforma: o.plataforma, loja: o.loja, mes: o.mes };
       map[key].n++;
       map[key].receita += o.receita;
       map[key].taxas += o.taxas;
@@ -400,7 +401,100 @@ export function reconciliationSummary(orders) {
       if (o._is_adjustment) map[key].adjustments++;
     }
   });
-  return { byPlat, byStore };
+  return { byPlat, byStore, byStoreMonth };
+}
+
+// Expected fee ranges per platform (taxa%)
+const TAXA_RANGES = {
+  "Shopee":        { min: 0.18, max: 0.32, nome: "Shopee" },
+  "Mercado Livre": { min: 0.20, max: 0.42, nome: "Mercado Livre" },
+  "TikTok":        { min: 0.22, max: 0.40, nome: "TikTok" },
+};
+
+// Max refund rate before flagging
+const MAX_REFUND_RATE = 0.10; // 10%
+
+export function detectAnomalies(orders, costs = {}) {
+  const warns = [];
+  if (!orders || orders.length === 0) return warns;
+
+  const byStore = {};
+  orders.forEach(o => {
+    if (!byStore[o.loja]) byStore[o.loja] = { plat: o.plataforma, loja: o.loja, n: 0, receita: 0, taxas: 0, repasse: 0, refunds: 0, negRep: 0, skusMissing: new Set() };
+    const st = byStore[o.loja];
+    st.n++;
+    st.receita += o.receita;
+    st.taxas += o.taxas;
+    st.repasse += o.repasse;
+    if (o._is_refund) st.refunds++;
+    if (o.repasse < 0 && !o._is_refund) st.negRep++;
+    if (o.sku && !(costs[o.sku] > 0)) st.skusMissing.add(o.sku);
+  });
+
+  Object.values(byStore).forEach(st => {
+    // Refund rate
+    const refRate = st.refunds / st.n;
+    if (refRate > MAX_REFUND_RATE) {
+      warns.push({
+        level: "warn", loja: st.loja,
+        msg: `Taxa de refund alta: ${(refRate*100).toFixed(1)}% (${st.refunds}/${st.n}). Limite saudável ≤ ${(MAX_REFUND_RATE*100).toFixed(0)}%.`
+      });
+    }
+    // Taxa%
+    if (st.receita > 0) {
+      const taxaPct = st.taxas / st.receita;
+      const range = TAXA_RANGES[st.plat];
+      if (range) {
+        if (taxaPct < range.min) {
+          warns.push({
+            level: "info", loja: st.loja,
+            msg: `Taxa% ${(taxaPct*100).toFixed(1)}% abaixo da faixa típica ${st.plat} (${(range.min*100).toFixed(0)}-${(range.max*100).toFixed(0)}%). Possível falta de pedidos com comissão.`
+          });
+        } else if (taxaPct > range.max) {
+          warns.push({
+            level: "error", loja: st.loja,
+            msg: `Taxa% ${(taxaPct*100).toFixed(1)}% ACIMA da faixa típica ${st.plat} (${(range.min*100).toFixed(0)}-${(range.max*100).toFixed(0)}%). Suspeita de bug na fórmula ou dados errados.`
+          });
+        }
+      }
+    }
+    // Repasse negativo inesperado (não refund)
+    if (st.negRep > 0) {
+      warns.push({
+        level: "info", loja: st.loja,
+        msg: `${st.negRep} pedido(s) com repasse negativo fora de refund — investigar.`
+      });
+    }
+    // SKUs sem custo
+    if (st.skusMissing.size > 0) {
+      warns.push({
+        level: "info", loja: st.loja,
+        msg: `${st.skusMissing.size} SKU(s) sem custo cadastrado. Afeta cálculo de lucro bruto.`
+      });
+    }
+  });
+
+  return warns;
+}
+
+// Compare calculated repasse vs user-provided expected. Returns per-store diff.
+export function compareExpected(byStore, expected = {}) {
+  const out = [];
+  Object.values(byStore).forEach(st => {
+    const exp = parseFloat(expected[st.loja]);
+    if (!isFinite(exp) || exp <= 0) {
+      out.push({ ...st, expected: null, diff: null, diffPct: null, status: "no-expected" });
+      return;
+    }
+    const diff = st.repasse - exp;
+    const diffPct = diff / exp;
+    let status = "ok";
+    const absPct = Math.abs(diffPct);
+    if (absPct > 0.03) status = "error";
+    else if (absPct > 0.01) status = "warn";
+    out.push({ ...st, expected: exp, diff, diffPct, status });
+  });
+  return out;
 }
 
 export function exportToExcel(orders, costs, despesas) {
