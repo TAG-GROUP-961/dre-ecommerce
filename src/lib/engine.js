@@ -474,7 +474,80 @@ export function detectAnomalies(orders, costs = {}) {
     }
   });
 
+  // Alerta de pedidos com lucro negativo (precisa de costs preenchidos)
+  if (Object.keys(costs).length > 0) {
+    const loss = lossAnalysis(orders, costs);
+    if (loss.totalNegCount > 0) {
+      warns.push({
+        level: "warn", loja: "— geral —",
+        msg: `${loss.totalNegCount} pedido(s) com lucro NEGATIVO — prejuízo total R$ ${Math.abs(loss.totalNegLoss).toFixed(2)}. Ver seção "SKUs com prejuízo" abaixo.`
+      });
+    }
+    // Por loja com mais de 5% de pedidos no negativo
+    Object.values(loss.byStore).forEach(bs => {
+      const st = byStore[bs.loja];
+      if (!st) return;
+      const rate = bs.negCount / st.n;
+      if (rate > 0.05 && bs.negCount >= 3) {
+        warns.push({
+          level: "error", loja: bs.loja,
+          msg: `${bs.negCount} de ${st.n} pedidos no prejuízo (${(rate*100).toFixed(1)}%) — R$ ${Math.abs(bs.negLoss).toFixed(2)} de prejuízo acumulado. Revisar preços ou custos.`
+        });
+      }
+    });
+  }
+
   return warns;
+}
+
+// Análise de prejuízo por SKU (lucro acumulado < 0) + por pedido
+export function lossAnalysis(orders, costs = {}) {
+  const bySku = {};
+  const byStore = {};
+  let totalNegCount = 0;
+  let totalNegLoss = 0;
+
+  orders.forEach(o => {
+    const cost = (costs[o.sku] || 0) * (o.qtd || 0);
+    const lucro = o.repasse - cost;
+
+    // Por pedido negativo (conta só se custo > 0 para evitar ruído de SKU sem custo)
+    if (lucro < 0 && cost > 0) {
+      totalNegCount++;
+      totalNegLoss += lucro;
+      if (!byStore[o.loja]) byStore[o.loja] = { loja: o.loja, plataforma: o.plataforma, negCount: 0, negLoss: 0 };
+      byStore[o.loja].negCount++;
+      byStore[o.loja].negLoss += lucro;
+    }
+
+    // Agregado por SKU
+    if (o.sku && cost > 0) {
+      if (!bySku[o.sku]) bySku[o.sku] = {
+        sku: o.sku, produto: o.produto || "",
+        pedidos: 0, qtd: 0, receita: 0, repasse: 0, cmv: 0, lucro: 0,
+        pedidosNeg: 0, custoUnit: costs[o.sku] || 0,
+      };
+      const s = bySku[o.sku];
+      s.pedidos++;
+      s.qtd += o.qtd || 0;
+      s.receita += o.receita;
+      s.repasse += o.repasse;
+      s.cmv += cost;
+      s.lucro += lucro;
+      if (lucro < 0) s.pedidosNeg++;
+    }
+  });
+
+  // Ranking de SKUs com prejuízo acumulado
+  const skuLossRanking = Object.values(bySku)
+    .filter(s => s.lucro < 0)
+    .sort((a, b) => a.lucro - b.lucro);
+
+  return {
+    totalNegCount, totalNegLoss,
+    byStore, bySku,
+    skuLossRanking,
+  };
 }
 
 // Compare calculated repasse vs user-provided expected. Returns per-store diff.

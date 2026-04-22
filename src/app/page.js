@@ -5,7 +5,7 @@ import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveCo
 import {
   detectPlatform, readExcelFile, readCostExcel, processShopee, processTikTok,
   processML, extractMonth, getTikTokMonths, exportToExcel, DEFAULT_STORES,
-  reconciliationSummary, detectAnomalies, compareExpected
+  reconciliationSummary, detectAnomalies, compareExpected, lossAnalysis
 } from "@/lib/engine";
 
 /* ═══ Theme ═══ */
@@ -223,6 +223,7 @@ function App() {
   const recon = useMemo(() => reconciliationSummary(orders), [orders]);
   const reconStoreRows = useMemo(() => compareExpected(recon.byStore, expected), [recon.byStore, expected]);
   const anomalies = useMemo(() => detectAnomalies(orders, costs), [orders, costs]);
+  const losses = useMemo(() => lossAnalysis(orders, costs), [orders, costs]);
 
   const platBadge = { Shopee: "bg-[#FF6B35]/15 text-[#FF6B35] border-[#FF6B35]/30", TikTok: "bg-[#69C9D0]/15 text-[#69C9D0] border-[#69C9D0]/30", "Mercado Livre": "bg-[#FFE600]/15 text-[#c5b200] border-[#FFE600]/30" };
 
@@ -449,6 +450,77 @@ function App() {
                 <span className="ml-auto">Valores esperados salvos automaticamente.</span>
               </div>
             </div>
+
+            {/* SKUs com prejuízo */}
+            {Object.keys(costs).length === 0 ? (
+              <div className={`p-4 ${t.accentLight} border rounded-2xl`}>
+                <p className="text-xs">ℹ️ Cadastre custos na aba <strong>Custos</strong> para habilitar análise de prejuízo por SKU.</p>
+              </div>
+            ) : (
+              <div className={`${t.card} rounded-2xl border ${t.border} overflow-hidden`}>
+                <div className={`px-5 py-3 border-b ${t.border} flex items-center gap-3 flex-wrap`}>
+                  <h3 className={`${t.text} font-bold text-[13px] uppercase tracking-wider`}>SKUs com prejuízo</h3>
+                  {losses.totalNegCount > 0 ? (
+                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${t.redBg}`}>
+                      {fmtInt(losses.totalNegCount)} pedidos no negativo · −R$ {fmt(Math.abs(losses.totalNegLoss))}
+                    </span>
+                  ) : (
+                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${t.greenBg}`}>Nenhum pedido no prejuízo ✓</span>
+                  )}
+                  <span className={`${t.textSub} text-[11px] ml-auto`}>Top {Math.min(losses.skuLossRanking.length, 20)} de {losses.skuLossRanking.length} SKU(s) com lucro acumulado &lt; 0</span>
+                </div>
+                {losses.skuLossRanking.length === 0 ? (
+                  <div className={`p-6 text-center ${t.textSub} text-sm`}>
+                    Todos os SKUs com custo cadastrado estão dando lucro 🎉
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-[13px]">
+                      <thead><tr className={`border-b ${t.border}`}>
+                        <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-left`}>SKU</th>
+                        <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-left`}>Produto</th>
+                        <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Pedidos</th>
+                        <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Qtd</th>
+                        <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Custo un.</th>
+                        <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Receita</th>
+                        <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Repasse</th>
+                        <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>CMV</th>
+                        <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Prejuízo</th>
+                        <th className={`px-4 py-2.5 text-[10px] uppercase tracking-[.12em] ${t.textSub} font-bold text-right`}>Pedidos neg.</th>
+                      </tr></thead>
+                      <tbody>
+                        {losses.skuLossRanking.slice(0, 20).map((s, i) => {
+                          const lossPorPedido = s.lucro / s.pedidos;
+                          return (<tr key={s.sku} className={`border-b border-transparent ${t.tableRow} ${i % 2 ? t.tableStripe : ""}`}>
+                            <td className={`px-4 py-2.5 ${t.accentText} font-mono text-[11px] cursor-pointer hover:underline`}
+                                title="Copiar SKU" onClick={() => { navigator.clipboard.writeText(s.sku); }}>{s.sku}</td>
+                            <td className={`px-4 py-2.5 ${t.text} truncate max-w-[200px]`} title={s.produto}>{s.produto}</td>
+                            <td className={`px-4 py-2.5 ${t.textSub} text-right tabular-nums`}>{fmtInt(s.pedidos)}</td>
+                            <td className={`px-4 py-2.5 ${t.textSub} text-right tabular-nums`}>{fmtInt(s.qtd)}</td>
+                            <td className={`px-4 py-2.5 ${t.textSub} text-right tabular-nums`}>R$ {fmt(s.custoUnit)}</td>
+                            <td className={`px-4 py-2.5 ${t.text} text-right tabular-nums`}>R$ {fmt(s.receita)}</td>
+                            <td className={`px-4 py-2.5 ${t.text} text-right tabular-nums`}>R$ {fmt(s.repasse)}</td>
+                            <td className={`px-4 py-2.5 ${t.textMuted} text-right tabular-nums`}>R$ {fmt(s.cmv)}</td>
+                            <td className={`px-4 py-2.5 ${t.red} text-right tabular-nums font-bold`}>
+                              R$ {fmt(s.lucro)}
+                              <div className={`${t.textMuted} font-normal text-[10px]`}>{fmt(lossPorPedido)}/pedido</div>
+                            </td>
+                            <td className={`px-4 py-2.5 text-right tabular-nums ${s.pedidosNeg === s.pedidos ? t.red : t.textSub}`}>
+                              {s.pedidosNeg}/{s.pedidos}
+                            </td>
+                          </tr>);
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {losses.skuLossRanking.length > 0 && (
+                  <div className={`px-5 py-3 border-t ${t.border} text-[11px] ${t.textSub}`}>
+                    💡 Clique no SKU para copiar. Ação sugerida: subir preço, rever custo cadastrado ou pausar anúncio.
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Totais por plataforma */}
             <div className={`${t.card} rounded-2xl border ${t.border} overflow-hidden`}>
